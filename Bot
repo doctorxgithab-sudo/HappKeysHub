@@ -1,0 +1,345 @@
+import asyncio
+import logging
+import uuid
+import string
+import random
+from datetime import datetime, timedelta
+
+from sqlalchemy import create_engine, Column, Integer, String, BigInteger, DateTime, Boolean, ForeignKey
+from sqlalchemy.orm import declarative_base, sessionmaker, relationship
+
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+)
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+
+# ===== НАСТРОЙКИ (ЗАМЕНИ ТОЛЬКО ЭТО) =====
+BOT_TOKEN = "8789987058:AAGK0Bcrjvof-f-tiC3Ddv4RJSlqDRrMltQ"
+ADMIN_IDS = [1927636816, 6451514367]          # Telegram ID админов
+# =====================================
+
+# --- База данных ---
+engine = create_engine("sqlite:///bot.db", echo=False)
+SessionLocal = sessionmaker(bind=engine)
+Base = declarative_base()
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True)
+    telegram_id = Column(BigInteger, unique=True, nullable=False)
+    username = Column(String, nullable=True)
+    referral_code = Column(String, unique=True, nullable=False)
+    referrer_id = Column(BigInteger, ForeignKey("users.telegram_id"), nullable=True)
+    balance_months = Column(Integer, default=0)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+    subscriptions = relationship("Subscription", back_populates="user")
+    referrer = relationship("User", remote_side=[telegram_id], backref="referrals")
+
+class Subscription(Base):
+    __tablename__ = "subscriptions"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(BigInteger, ForeignKey("users.telegram_id"), nullable=False)
+    plan_name = Column(String, nullable=False)
+    key = Column(String, nullable=False)
+    devices = Column(Integer, default=3)
+    start_date = Column(DateTime, default=datetime.utcnow)
+    end_date = Column(DateTime, nullable=False)
+    is_active = Column(Boolean, default=True)
+
+    user = relationship("User", back_populates="subscriptions")
+
+class ReferralReward(Base):
+    __tablename__ = "referral_rewards"
+    id = Column(Integer, primary_key=True)
+    referrer_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    referred_user_id = Column(BigInteger, ForeignKey("users.telegram_id"))
+    reward_months = Column(Integer, default=1)
+    given = Column(Boolean, default=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+Base.metadata.create_all(bind=engine)
+
+def generate_vpn_key():
+    return f"happ-{uuid.uuid4().hex[:16]}"
+
+def generate_referral_code():
+    chars = string.ascii_letters + string.digits
+    return ''.join(random.choices(chars, k=8))
+
+# ========== ПОДПИСКИ ==========
+SUBSCRIPTIONS = {
+    "limited": {
+        "name": "LIMITED KEY 🌐",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/13795"
+    },
+    "happkeys": {
+        "name": "HappKeysHub 🎮",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/15328"
+    },
+    "premium": {
+        "name": "Premium 🔥",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/14972"
+    },
+    "speed": {
+        "name": "Speed Key ☄️",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/15211"
+    },
+    "project": {
+        "name": "Project Key ✈️",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/15323"
+    },
+    "rocket": {
+        "name": "Rocket Key 🚀",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/15323"
+    },
+    "sun": {
+        "name": "SunKey ☀️",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/15326"
+    },
+    "moon": {
+        "name": "MoonKey 🌛",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/15327"
+    },
+    "poison": {
+        "name": "The Poison Key ☣️",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/15325"
+    },
+    "premium_sub": {
+        "name": "Premium Подписка 🌌",
+        "price": "❓ (смотри на сайте)",
+        "url": "https://dip-x.store/product/16398"
+    },
+    "random": {
+        "name": "Random Подписка ❓",
+        "price": "❓ (Высокие риски!)",
+        "url": "https://dip-x.store/product/14645"
+    },
+}
+
+FREE_KEY_URL = "https://gist.githubusercontent.com/HappKeysHub2/330355b333137b3cf0123d648e364810/raw/HappKeysHub%2520Free%2520%25F0%259F%2586%2593"
+
+# --- Клавиатуры ---
+def main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🛒 Купить подписку", callback_data="buy")],
+        [InlineKeyboardButton(text="📞 Поддержка", callback_data="support")],
+        [InlineKeyboardButton(text="🤝 Партнёрская программа", callback_data="partner")]
+    ])
+
+def subscriptions_menu():
+    buttons = []
+    for key, sub in SUBSCRIPTIONS.items():
+        text = sub["name"]
+        if sub.get("url") is None:
+            text += " (НЕДОСТУПНО)"
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"sub_{key}")])
+    buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="start")])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+def back_to_main():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="◀️ В главное меню", callback_data="start")]
+    ])
+
+bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+dp = Dispatcher()
+
+# ---------- /start ----------
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    user = message.from_user
+    session = SessionLocal()
+    try:
+        db_user = session.query(User).filter_by(telegram_id=user.id).first()
+        if not db_user:
+            ref_code = generate_referral_code()
+            referrer_id = None
+            args = message.text.split()
+            if len(args) > 1 and args[1].startswith("ref_"):
+                ref_code_param = args[1][4:]
+                referrer = session.query(User).filter_by(referral_code=ref_code_param).first()
+                if referrer and referrer.telegram_id != user.id:
+                    referrer_id = referrer.telegram_id
+            db_user = User(
+                telegram_id=user.id,
+                username=user.username,
+                referral_code=ref_code,
+                referrer_id=referrer_id
+            )
+            session.add(db_user)
+            session.commit()
+    finally:
+        session.close()
+
+    text = (
+        "Здравствуйте!\n\n"
+        "Мы рады предложить вам выгодную подписку на длительный срок. "
+        "Вы сможете подключить до трёх устройств, и стоимость подписки вас приятно удивит.\n\n"
+        "Не упустите возможность стать нашим клиентом!"
+    )
+    await message.answer(text, reply_markup=main_menu())
+
+@dp.message(Command("support"))
+async def cmd_support(message: Message):
+    text = (
+        "# Команда поддержки\n\n"
+        "• Поддержка: @HappKeysHubSupportBot\n"
+        "• Время работы: с 12:00 до 0:00 по московскому времени."
+    )
+    await message.answer(text, reply_markup=back_to_main())
+
+@dp.message(Command("partner"))
+async def cmd_partner(message: Message):
+    session = SessionLocal()
+    try:
+        user = session.query(User).filter_by(telegram_id=message.from_user.id).first()
+        if not user:
+            ref_code = generate_referral_code()
+            user = User(
+                telegram_id=message.from_user.id,
+                username=message.from_user.username,
+                referral_code=ref_code,
+                referrer_id=None
+            )
+            session.add(user)
+            session.commit()
+
+        invited_count = session.query(User).filter_by(referrer_id=user.telegram_id).count()
+        bot_username = (await bot.me()).username
+        ref_link = f"https://t.me/{bot_username}?start=ref_{user.referral_code}"
+
+        text = (
+            "🤝 <b>Партнёрская программа</b>\n\n"
+            "Приглашайте друзей в наш VPN-сервис и получайте <b>1 бесплатный месяц</b> "
+            "за каждого, кто оформит любую подписку по вашей ссылке.\n"
+            "Бонусные месяцы автоматически прибавятся к следующей оплаченной подписке.\n\n"
+            f"🔗 <b>Ваша реферальная ссылка:</b>\n<code>{ref_link}</code>\n\n"
+            f"👥 Приглашено пользователей: <b>{invited_count}</b>\n"
+            f"🎁 Бесплатных месяцев на балансе: <b>{user.balance_months}</b>\n"
+        )
+
+        if invited_count >= 3:
+            text += (
+                "\n🎉 <b>Вы пригласили 3 друзей и получаете бесплатный ключ!</b>\n"
+                f"🔑 Ключ: <code>{FREE_KEY_URL}</code>\n"
+                "Инструкция: скопируйте ключ и вставьте в приложении Happ."
+            )
+        else:
+            text += f"\nПригласите ещё {3 - invited_count} друзей, чтобы получить бесплатный ключ."
+
+    finally:
+        session.close()
+    await message.answer(text, reply_markup=back_to_main())
+
+@dp.callback_query(F.data == "start")
+async def back_to_start(call: CallbackQuery):
+    await call.message.edit_text(
+        "Здравствуйте!\n\n"
+        "Мы рады предложить вам выгодную подписку на длительный срок...",
+        reply_markup=main_menu()
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "buy")
+async def show_subscriptions(call: CallbackQuery):
+    await call.message.edit_text("Выберите подписку:", reply_markup=subscriptions_menu())
+    await call.answer()
+
+@dp.callback_query(F.data == "support")
+async def inline_support(call: CallbackQuery):
+    text = (
+        "# Команда поддержки\n\n"
+        "• Поддержка: @HappKeysHubSupportBot\n"
+        "• Время работы: с 12:00 до 0:00 по московскому времени."
+    )
+    await call.message.edit_text(text, reply_markup=back_to_main())
+    await call.answer()
+
+@dp.callback_query(F.data == "partner")
+async def inline_partner(call: CallbackQuery):
+    await cmd_partner(call.message)
+    await call.answer()
+
+@dp.callback_query(F.data.startswith("sub_"))
+async def process_subscription(call: CallbackQuery):
+    sub_key = call.data[4:]
+    sub = SUBSCRIPTIONS.get(sub_key)
+    if not sub:
+        await call.answer("Подписка не найдена", show_alert=True)
+        return
+
+    if sub.get("url"):
+        text = (
+            f"🛒 <b>{sub['name']}</b>\n"
+            f"💰 Цена: {sub['price']}\n\n"
+            f"Для оплаты перейдите по ссылке:\n{ sub['url'] }\n\n"
+            f"После оплаты вы получите ключ в течение 24 часов."
+        )
+    else:
+        text = f"❌ <b>{sub['name']}</b> сейчас недоступна."
+
+    await call.message.edit_text(text, reply_markup=back_to_main())
+    await call.answer()
+
+@dp.message(Command("broadcast"))
+async def cmd_broadcast(message: Message):
+    if message.from_user.id not in ADMIN_IDS:
+        await message.answer("⛔ У вас нет доступа к этой команде.")
+        return
+
+    text = message.text.removeprefix("/broadcast").strip()
+    if not text:
+        await message.answer("❌ Укажите текст рассылки после команды.\nПример: /broadcast Всем привет!")
+        return
+
+    session = SessionLocal()
+    try:
+        users = session.query(User).all()
+        if not users:
+            await message.answer("⚠️ В базе нет пользователей.")
+            return
+
+        await message.answer(f"📣 Начинаю рассылку на {len(users)} пользователей...")
+
+        success = 0
+        failed = 0
+        for user in users:
+            try:
+                await bot.send_message(user.telegram_id, text)
+                success += 1
+                await asyncio.sleep(0.05)
+            except Exception as e:
+                logging.warning(f"Не удалось отправить {user.telegram_id}: {e}")
+                failed += 1
+
+        await message.answer(
+            f"✅ Рассылка завершена.\n"
+            f"▪️ Успешно: {success}\n"
+            f"▪️ Не удалось: {failed}"
+        )
+    except Exception as e:
+        await message.answer(f"❌ Ошибка при рассылке: {e}")
+    finally:
+        session.close()
+
+# ---------- ЗАПУСК (ПОЛЛИНГ, БЕЗ ВЕБХУКОВ) ----------
+async def main():
+    logging.basicConfig(level=logging.INFO)
+    print("Бот запущен...")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
